@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# WhatsApp / Baileys auth state — contains login keys, do NOT commit
+auth/
+
+# Selenium persistent browser profile (cookies, cache)
+.chrome-profile/
+
+# Claude / IDE
+.claude/
+.vscode/
+.idea/
+
+# Runtime state written by the scraper
+.scraper-state.json
+.scraper-state.mock.json
+
+# Transient EOB PDFs downloaded for forwarding
+.downloads/
+
+# Scratch / temp
+temp.js
+*.tmp
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+yarn.lock

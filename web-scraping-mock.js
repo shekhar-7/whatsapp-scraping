@@ -157,21 +157,16 @@ async function getLatest() {
 // WhatsApp message formatting + sending
 // ----------------------------------------------------------------------------
 
-function formatErnMessage(row, meta) {
+function formatErnMessage(row /* , meta */) {
 
     const fmt = (s) => (s && String(s).trim()) || '—';
     const amount = (row.depositAmount && row.depositAmount.trim()) || '$0.00';
 
-    const header = meta && meta.firstRun
-        ? '🧪 *[MOCK] Tracking started — latest ERN*'
-        : '🧪 *[MOCK] New ERN*';
-
     return [
-        header,
+        `💰 *${amount}*`,
         '',
-        `*${fmt(row.insurance)}*`,
-        `💰 *${amount}*  ·  ${fmt(row.ernDate)}`,
-        `Report #${fmt(row.reportKey)}`
+        fmt(row.ernDate),
+        fmt(row.insurance)
     ].join('\n');
 }
 

@@ -3,18 +3,59 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 
-const qrcode = require('qrcode-terminal');
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    fetchLatestBaileysVersion,
-    DisconnectReason
-} = require('@whiskeysockets/baileys');
-const P = require('pino');
+const { EventEmitter } = require('events');
+const { execSync } = require('child_process');
 
 const { Builder, By, until, Capabilities } = require('selenium-webdriver');
 const chrome = require('selenium-webdriver/chrome');
 const chromedriver = require('chromedriver');
+
+const wa = require('./whatsapp');
+const recipients = require('./recipients');
+const { createServer } = require('./server');
+
+// ----------------------------------------------------------------------------
+// Brightree scraper login state
+//
+// Brightree only allows one active session per account, so we must NEVER
+// auto-relogin from inside the watch loop — that would kick the human user
+// off whichever device they just logged in from, which then kicks the bot
+// off, ad infinitum.
+//
+// The bot logs in exactly when the user asks for it (first boot OR an
+// explicit "Login" click). If a tick later discovers the session has been
+// taken over (we get redirected to the login form), we stop and wait — no
+// silent re-login.
+// ----------------------------------------------------------------------------
+
+const SCRAPER_STATE = {
+    UNKNOWN: 'unknown',          // never tried — next tick may log in
+    ACTIVE: 'active',            // we have a working Brightree session
+    SESSION_LOST: 'session-lost', // got bounced to login by another device
+    LOGGED_OUT: 'logged-out'     // user clicked Logout
+};
+
+const scraperEvents = new EventEmitter();
+let scraperState = SCRAPER_STATE.UNKNOWN;
+let scraperLoginInFlight = false;
+
+function setScraperState(next) {
+    if (next === scraperState) return;
+    scraperState = next;
+    console.log(`[scraper] state -> ${next}`);
+    scraperEvents.emit('state', next);
+}
+
+function getScraperState() {
+    return scraperState;
+}
+
+class SessionLostError extends Error {
+    constructor() {
+        super('Brightree session was taken over by another login');
+        this.code = 'SESSION_LOST';
+    }
+}
 
 // ----------------------------------------------------------------------------
 // Config
@@ -51,6 +92,36 @@ async function getDriver() {
         }
         if (!fs.existsSync(DOWNLOAD_DIR)) {
             fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+        }
+
+        // Kill any orphaned browser still running against our profile dir
+        // BEFORE wiping the Singleton* locks. Otherwise the lock cleanup
+        // would let a second instance launch alongside the orphan, the
+        // two would fight over the profile, and one would crash (which
+        // is what triggers the macOS "closed unexpectedly" popup).
+        //
+        // The pattern is scoped to our --user-data-dir, so the user's
+        // personal Brave (with its default profile) is left alone.
+        try {
+            execSync(
+                `pkill -f -- "--user-data-dir=${PROFILE_DIR}"`,
+                { stdio: 'ignore' }
+            );
+            // pkill returns immediately; give the OS a beat to actually
+            // tear down the process so its lock files are gone.
+            await new Promise((r) => setTimeout(r, 300));
+        } catch (_) {
+            // pkill exits non-zero when it found no matches — fine.
+        }
+
+        // Stale Singleton* lock files from a prior unclean shutdown make
+        // Brave/Chrome refuse to launch ("Chrome instance exited"). Clean
+        // them up before every start so a Ctrl+C/crash doesn't brick the
+        // next run.
+        for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+            try {
+                fs.rmSync(path.join(PROFILE_DIR, name), { force: true });
+            } catch (_) { /* ignore */ }
         }
 
         const options = new chrome.Options();
@@ -163,10 +234,24 @@ async function isOnErnPage(driver) {
     return !(await isOnLoginPage(driver));
 }
 
+/**
+ * Make sure the driver is on the ERN page with a valid session.
+ *
+ * The watch loop now follows a login → scrape → release pattern: at the
+ * start of every tick we may need to log in fresh, and at the end of the
+ * tick we deliberately drop the session so the user can use Brightree on
+ * another device while the bot is idle.
+ *
+ * If submitting credentials still doesn't land us on the ERN page (the
+ * most common reason: another session is currently active and Brightree
+ * blocks the login), we throw SessionLostError so the caller backs off
+ * without forcing the issue. The next tick will try again — no manual
+ * recovery needed.
+ */
 async function ensureSession(driver) {
 
     if (pageLoaded && (await isOnErnPage(driver))) {
-        // Already authenticated and on the right page — stay put.
+        setScraperState(SCRAPER_STATE.ACTIVE);
         return;
     }
 
@@ -179,12 +264,67 @@ async function ensureSession(driver) {
         await driver.sleep(1500);
     }
 
-    if (await isOnLoginPage(driver)) {
+    if (!(await isOnErnPage(driver))) {
+        // Could be: (a) login form still visible (creds rejected), or
+        // (b) Brightree's "another session is active" warning page. Either
+        // way, don't fight — back off and let the next tick try.
         pageLoaded = false;
-        throw new Error('Still on login page after submitting credentials');
+        setScraperState(SCRAPER_STATE.SESSION_LOST);
+        throw new SessionLostError();
     }
 
     pageLoaded = true;
+    setScraperState(SCRAPER_STATE.ACTIVE);
+}
+
+/**
+ * Drop the Brightree session so other devices can log in. Tries to click
+ * a logout link first (proper server-side invalidation) and clears
+ * cookies as a safety net regardless.
+ */
+async function releaseBrightreeSession(driver) {
+
+    try {
+
+        // Look for a logout-shaped element on the current page.
+        const logoutEls = await driver.findElements(
+            By.css(
+                'a[href*="ogout" i], ' +
+                'a[id*="ogout" i], ' +
+                'input[id*="ogout" i], ' +
+                'button[id*="ogout" i]'
+            )
+        );
+
+        if (logoutEls.length) {
+            console.log('[scraper] clicking logout link to release session');
+            try {
+                await logoutEls[0].click();
+            } catch (_) {
+                // Fallback to JS-click in case Telerik intercepts it.
+                await driver.executeScript(
+                    'arguments[0].click();',
+                    logoutEls[0]
+                );
+            }
+            await driver.sleep(1500);
+        }
+
+    } catch (err) {
+        console.warn(
+            `[scraper] logout-link click failed: ${err.message}`
+        );
+    }
+
+    // Belt-and-suspenders: even if the click worked, wipe cookies for the
+    // current domain so the local profile is genuinely "logged out".
+    try {
+        await driver.manage().deleteAllCookies();
+    } catch (_) { /* ignore */ }
+
+    pageLoaded = false;
+    // Back to UNKNOWN so the next tick is allowed to attempt login.
+    setScraperState(SCRAPER_STATE.UNKNOWN);
 }
 
 // ----------------------------------------------------------------------------
@@ -505,6 +645,9 @@ async function getLatest() {
         lastReportKey: latest.reportKey,
         lastTraceNumber: latest.traceNumber,
         lastErnDate: latest.ernDate,
+        lastInsurance: latest.insurance,
+        lastDepositAmount: latest.depositAmount,
+        lastSource: latest.source,
         lastSeenAt: new Date().toISOString()
     });
 
@@ -531,56 +674,126 @@ function formatErnMessage(row /* , meta */) {
     ].join('\n');
 }
 
-function formatNumber(number) {
-    return number.replace(/\D/g, '') + '@s.whatsapp.net';
-}
+async function ensureFreshSession(sock, jid) {
 
-async function ensureFreshSession(sock, jid, to) {
     if (typeof sock.assertSessions !== 'function') return;
+
+    if (typeof jid === 'string' && jid.endsWith('@g.us')) {
+
+        // Group sends use Sender Keys, but Baileys still needs a fresh
+        // Signal session with EACH OTHER participant to deliver the
+        // sender-key distribution message. Without this step the
+        // recipient's app shows "Waiting for this message…" until both
+        // sides re-sync — exactly the symptom we hit on first send.
+        try {
+            const others = await wa.getOtherParticipantJids(jid);
+            if (others && others.length) {
+                await sock.assertSessions(others, true);
+            }
+        } catch (e) {
+            console.warn(
+                `[whatsapp] group session warmup warning for ${jid}: ${e.message}`
+            );
+        }
+        return;
+    }
+
     try {
         await sock.assertSessions([jid], true);
     } catch (e) {
         console.warn(
-            `[whatsapp] assertSessions warning for ${to}: ${e.message}`
+            `[whatsapp] assertSessions warning for ${jid}: ${e.message}`
         );
     }
 }
 
-async function sendWhatsAppMessage(sock, to, messageBody) {
+function isGroupJid(jid) {
+    return typeof jid === 'string' && jid.endsWith('@g.us');
+}
 
-    const jid = formatNumber(to);
+async function debugLogGroupContext(jid) {
+
+    if (!isGroupJid(jid)) return;
 
     try {
-        await ensureFreshSession(sock, jid, to);
-        await sock.sendMessage(jid, { text: messageBody });
-        console.log(`[whatsapp] sent text to ${to}`);
-    } catch (error) {
-        console.error(`[whatsapp] send to ${to} failed: ${error.message}`);
+        const meta = await wa.getCachedGroupMetadata(jid);
+        if (!meta) {
+            console.warn(
+                `[whatsapp] no group metadata available for ${jid} — ` +
+                `the bot's account may not be a member of this group`
+            );
+            return;
+        }
+
+        const participants = meta.participants || [];
+        // Strip device suffix AND keep the @domain — comparing base ids
+        // across formats (`@s.whatsapp.net` vs `@lid`) was previously the
+        // source of botIsMember false-negatives.
+        const isMember = participants.some((p) => wa.isSelfId(p.id));
+
+        console.log(
+            `[whatsapp] group "${meta.subject}" ` +
+            `participants=${participants.length} ` +
+            `botIsMember=${isMember}`
+        );
+
+        if (!isMember) {
+            console.warn(
+                '[whatsapp] >>> bot account is NOT in this group; the ' +
+                'message will not be delivered. Add the bot number to ' +
+                'the group from your phone first.'
+            );
+        }
+    } catch (err) {
+        console.warn(
+            `[whatsapp] group context lookup failed for ${jid}: ${err.message}`
+        );
     }
 }
 
-async function sendWhatsAppDocument(sock, to, filePath, caption, fileName) {
-
-    const jid = formatNumber(to);
-
+async function sendWhatsAppMessage(sock, jid, messageBody) {
     try {
-        await ensureFreshSession(sock, jid, to);
+        await debugLogGroupContext(jid);
+        await ensureFreshSession(sock, jid);
+        const result = await sock.sendMessage(jid, { text: messageBody });
+        const id = result && result.key && result.key.id;
+        if (id && result.message) {
+            wa.rememberSentMessage(id, result.message);
+        }
+        console.log(`[whatsapp] sent text to ${jid} (id=${id || 'unknown'})`);
+    } catch (error) {
+        console.error(
+            `[whatsapp] send to ${jid} failed: ${error && error.stack || error}`
+        );
+    }
+}
+
+async function sendWhatsAppDocument(sock, jid, filePath, caption, fileName) {
+    try {
+        await debugLogGroupContext(jid);
+        await ensureFreshSession(sock, jid);
 
         const buffer = fs.readFileSync(filePath);
 
-        await sock.sendMessage(jid, {
+        const result = await sock.sendMessage(jid, {
             document: buffer,
             mimetype: 'application/pdf',
             fileName,
             caption
         });
 
+        const id = result && result.key && result.key.id;
+        if (id && result.message) {
+            wa.rememberSentMessage(id, result.message);
+        }
         console.log(
-            `[whatsapp] sent PDF (${path.basename(filePath)}) to ${to}`
+            `[whatsapp] sent PDF (${path.basename(filePath)}) to ${jid} ` +
+            `(id=${id || 'unknown'})`
         );
     } catch (error) {
         console.error(
-            `[whatsapp] document send to ${to} failed: ${error.message}`
+            `[whatsapp] document send to ${jid} failed: ` +
+            (error && error.stack || error)
         );
     }
 }
@@ -592,10 +805,41 @@ async function sendWhatsAppDocument(sock, to, filePath, caption, fileName) {
 let scrapeTimer = null;
 let scrapeInFlight = false;
 
-async function tickOnce(sock, targetNumbers) {
+function getActiveJids() {
+
+    const list = recipients.getAll();
+    const jids = [];
+
+    for (const r of list) {
+        const jid = recipients.toJid(r);
+        if (jid) jids.push(jid);
+    }
+
+    return jids;
+}
+
+async function tickOnce() {
 
     if (scrapeInFlight) {
         console.log('[watch] previous tick still running, skipping');
+        return;
+    }
+
+    const sock = wa.getSocket();
+    if (!sock) {
+        console.log('[watch] WhatsApp not connected, skipping tick');
+        return;
+    }
+
+    const jids = getActiveJids();
+    if (!jids.length) {
+        console.log('[watch] no recipients configured, skipping tick');
+        return;
+    }
+
+    // Manual pause from the UI ("Logout" button) — don't auto-relogin.
+    if (scraperState === SCRAPER_STATE.LOGGED_OUT) {
+        console.log('[watch] Brightree paused by user — skipping tick.');
         return;
     }
 
@@ -621,7 +865,7 @@ async function tickOnce(sock, targetNumbers) {
 
         const total = result.newRecords.length;
         console.log(
-            `[watch] sending ${total} record(s) ` +
+            `[watch] sending ${total} record(s) to ${jids.length} recipient(s) ` +
             `(firstRun=${result.firstRun})`
         );
 
@@ -630,15 +874,9 @@ async function tickOnce(sock, targetNumbers) {
         for (let i = 0; i < total; i++) {
 
             const row = result.newRecords[i];
+            const messageBody = formatErnMessage(row);
 
-            const messageBody = formatErnMessage(row, {
-                firstRun: result.firstRun,
-                index: i + 1,
-                total
-            });
-
-            // Best-effort: try to download the EOB PDF for this row.
-            // If it fails for any reason, fall back to text-only send.
+            // Best-effort EOB PDF; fall back to text on failure.
             let pdfPath = null;
             if (row.eobId) {
                 try {
@@ -651,36 +889,65 @@ async function tickOnce(sock, targetNumbers) {
                 }
             }
 
-            const fileName = 'ERN.pdf';
-
-            for (const number of targetNumbers) {
+            for (const jid of jids) {
                 if (pdfPath) {
                     await sendWhatsAppDocument(
                         sock,
-                        number,
+                        jid,
                         pdfPath,
                         messageBody,
-                        fileName
+                        'ERN.pdf'
                     );
                 } else {
-                    await sendWhatsAppMessage(sock, number, messageBody);
+                    await sendWhatsAppMessage(sock, jid, messageBody);
                 }
             }
 
-            // Clean up the PDF after sending so .downloads doesn't grow.
             if (pdfPath) {
                 try { fs.unlinkSync(pdfPath); } catch (_) { /* ignore */ }
             }
         }
 
     } catch (err) {
-        console.error('[watch] tick error:', err.message);
+        if (err && err.code === 'SESSION_LOST') {
+            // Login was blocked (most likely because someone else is logged
+            // into Brightree right now). Don't fight; the next tick will
+            // try again automatically.
+            console.warn(
+                '[watch] tick skipped: Brightree login blocked, probably ' +
+                'because another device is currently using the session. ' +
+                'Will retry on the next tick.'
+            );
+        } else {
+            console.error('[watch] tick error:', err.message);
+        }
     } finally {
+
+        // By default we KEEP the session open between ticks — appropriate
+        // when other users have their own separate Brightree accounts.
+        // Set SCRAPER_RELEASE_BETWEEN_TICKS=true if multiple devices need
+        // to share the SAME account and the bot should release the
+        // session every tick.
+        const releaseEnabled =
+            String(process.env.SCRAPER_RELEASE_BETWEEN_TICKS || 'false')
+                .toLowerCase() === 'true';
+
+        if (releaseEnabled && scraperState === SCRAPER_STATE.ACTIVE) {
+            try {
+                const driver = await getDriver();
+                await releaseBrightreeSession(driver);
+            } catch (err) {
+                console.warn(
+                    `[scraper] session release failed: ${err.message}`
+                );
+            }
+        }
+
         scrapeInFlight = false;
     }
 }
 
-function startWatchLoop(sock, targetNumbers) {
+function startWatchLoop() {
 
     if (scrapeTimer) return;
 
@@ -688,12 +955,8 @@ function startWatchLoop(sock, targetNumbers) {
         `\n[watch] starting loop, every ${SCRAPE_INTERVAL_MS}ms\n`
     );
 
-    // Run immediately, then on interval.
-    tickOnce(sock, targetNumbers);
-    scrapeTimer = setInterval(
-        () => tickOnce(sock, targetNumbers),
-        SCRAPE_INTERVAL_MS
-    );
+    tickOnce();
+    scrapeTimer = setInterval(tickOnce, SCRAPE_INTERVAL_MS);
 }
 
 function stopWatchLoop() {
@@ -704,94 +967,168 @@ function stopWatchLoop() {
 }
 
 // ----------------------------------------------------------------------------
-// WhatsApp bot lifecycle
+// Manual scraper login / logout (driven by the settings UI)
 // ----------------------------------------------------------------------------
 
-let isConnecting = false;
+async function loginToBrightree() {
 
-async function startBot() {
+    if (scraperLoginInFlight) {
+        throw new Error('Login already in progress — try again in a moment');
+    }
 
-    if (isConnecting) return;
-    isConnecting = true;
+    scraperLoginInFlight = true;
 
     try {
-
-        const targetNumbers = [
-            process.env.TEST_TARGET_NUMBER || '+919876543210'
-        ];
-
-        const { state, saveCreds } = await useMultiFileAuthState('./auth');
-        const { version } = await fetchLatestBaileysVersion();
-
-        console.log('Using WA Version:', version);
-
-        const sock = makeWASocket({
-            version,
-            auth: state,
-            logger: P({ level: 'silent' }),
-            browser: ['Ubuntu', 'Chrome', '20.0.04']
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on( 'connection.update', async (update) => {
-
-            const { connection, lastDisconnect, qr } = update;
-
-            if (qr) {
-                console.log('\nScan this QR using WhatsApp:\n');
-                qrcode.generate(qr, { small: true });
-            }
-
-            if (connection === 'open') {
-                console.log('\n✅ WhatsApp connected\n');
-                // Give Baileys a moment to finish prekey upload + presence
-                // sync before we start firing messages — sending too early
-                // can leave the recipient stuck on "Waiting for this message".
-                setTimeout(() => startWatchLoop(sock, targetNumbers), 3000);
-            }
-
-            if (connection === 'close') {
-
-                stopWatchLoop();
-                isConnecting = false;
-
-                const error = lastDisconnect?.error;
-                const statusCode = error?.output?.statusCode;
-
-                console.log('\n❌ WhatsApp connection closed');
-                console.log(JSON.stringify(
-                    { statusCode, error: error?.message },
-                    null,
-                    2
-                ));
-
-                if (statusCode !== DisconnectReason.loggedOut) {
-                    console.log('\n🔄 Reconnecting in 5 seconds...\n');
-                    setTimeout(startBot, 5000);
-                } else {
-                    console.log('\n🚪 Logged out from WhatsApp\n');
-                    await closeDriver();
-                }
-            }
-        });
-
-    } catch (error) {
-        isConnecting = false;
-        console.error('\nFatal error:', error);
-        setTimeout(startBot, 5000);
+        const driver = await getDriver();
+        // Reset state so ensureSession's first check ("are we already on
+        // the ERN page?") doesn't short-circuit before we navigate.
+        if (scraperState === SCRAPER_STATE.LOGGED_OUT) {
+            setScraperState(SCRAPER_STATE.UNKNOWN);
+        }
+        await ensureSession(driver);
+        return getScraperState();
+    } finally {
+        scraperLoginInFlight = false;
     }
 }
 
-// Graceful shutdown — close the browser on Ctrl+C so the next run starts clean.
+async function logoutFromBrightree() {
+
+    // We don't actively hit a Brightree logout URL — the user may want the
+    // session to persist on the original device. We just stop using it
+    // from the bot's side: mark logged-out so the watch loop pauses, and
+    // close the Selenium driver so its cookies are released.
+    setScraperState(SCRAPER_STATE.LOGGED_OUT);
+    pageLoaded = false;
+
+    try {
+        await closeDriver();
+    } catch (_) { /* ignore */ }
+}
+
+// Surface for server.js so the API can drive the scraper.
+const scraperApi = {
+    getState: getScraperState,
+    on: scraperEvents.on.bind(scraperEvents),
+    off: scraperEvents.off.bind(scraperEvents),
+    login: loginToBrightree,
+    logout: logoutFromBrightree,
+    // Trigger an on-demand tick — used by POST /api/scrape-now so cron or
+    // any other external scheduler can drive the scrape from outside the
+    // process without spawning a fresh node.
+    tickNow: () => tickOnce()
+};
+
+/**
+ * Wipe app-local state that's tied to the paired WhatsApp account:
+ * recipient list and the last-synced ERN baseline. Called on logout so the
+ * next paired device starts from a clean slate.
+ *
+ * Intentionally NOT called on transient disconnects (network blips,
+ * Baileys restart-required) — those will reconnect using the same auth
+ * and the data is still relevant.
+ */
+function clearLocalAppData() {
+
+    const targets = [
+        path.resolve(__dirname, 'recipients.json'),
+        path.resolve(__dirname, '.scraper-state.json')
+    ];
+
+    for (const file of targets) {
+        try {
+            fs.rmSync(file, { force: true });
+            console.log(`[boot] cleared ${path.basename(file)} on logout`);
+        } catch (err) {
+            console.warn(
+                `[boot] could not clear ${path.basename(file)}: ${err.message}`
+            );
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Boot — Express server + WhatsApp manager + watch loop
+// ----------------------------------------------------------------------------
+
+const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
+
+async function boot() {
+
+    // Start the HTTP server first so the user can manage WhatsApp from the UI
+    // even if there's nothing paired yet.
+    const app = createServer({ scraper: scraperApi });
+    app.listen(HTTP_PORT, () => {
+        console.log(
+            `\n🌐  Settings UI: http://localhost:${HTTP_PORT}\n`
+        );
+    });
+
+    // Tie the watch loop to WhatsApp connection state.
+    wa.on('connected', () => {
+        // Settle delay before sending — avoids "Waiting for this message...".
+        setTimeout(startWatchLoop, 3000);
+    });
+
+    wa.on('disconnected', (info) => {
+        stopWatchLoop();
+        // Only wipe app-local state on a real logout (manual disconnect
+        // or server-initiated unpair). Transient drops will reconnect
+        // and the data is still relevant.
+        if (info && info.loggedOut) {
+            clearLocalAppData();
+        }
+    });
+
+    // If we have saved auth, auto-connect on boot. Otherwise wait for the
+    // user to click "Connect" in the UI to trigger pairing.
+    const hasAuth = fs.existsSync(path.resolve(__dirname, 'auth')) &&
+        fs.readdirSync(path.resolve(__dirname, 'auth')).length > 0;
+
+    if (hasAuth) {
+        console.log('[boot] saved auth detected — auto-connecting WhatsApp');
+        wa.start().catch((err) => console.error('[boot] wa.start failed:', err));
+    } else {
+        console.log(
+            '[boot] no saved auth — open the settings UI and click ' +
+            '"Connect" to pair a device'
+        );
+    }
+}
+
+let shuttingDown = false;
+
 async function shutdown(signal) {
+
+    // Re-entry guard so a second Ctrl+C doesn't race with the first.
+    if (shuttingDown) {
+        console.log('Force exit.');
+        process.exit(1);
+    }
+    shuttingDown = true;
+
     console.log(`\nReceived ${signal}, shutting down...`);
     stopWatchLoop();
-    await closeDriver();
+
+    // Wait for the browser to actually close; otherwise the chromedriver
+    // child process gets orphaned and leaves Singleton lock files behind
+    // that block the next start.
+    try {
+        await Promise.race([
+            closeDriver(),
+            new Promise((resolve) => setTimeout(resolve, 8000))
+        ]);
+    } catch (err) {
+        console.warn('Shutdown error:', err.message);
+    }
+
     process.exit(0);
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-startBot();
+boot().catch((err) => {
+    console.error('Fatal boot error:', err);
+    process.exit(1);
+});

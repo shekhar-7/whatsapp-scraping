@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WhatsApp Scraper — Settings</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+    <div class="header-left">
+        <h1>WhatsApp Scraper</h1>
+        <span class="subtitle">Settings</span>
+    </div>
+    <button id="logout-btn" class="secondary tiny hidden">Logout</button>
+</header>
+
+<main>
+
+    <section class="card" id="status-card">
+        <h2>Connection</h2>
+        <div class="status-row">
+            <img id="status-avatar"
+                 class="avatar"
+                 src="default-avatar.svg"
+                 alt="">
+            <div class="status-info">
+                <div class="status-line">
+                    <span class="dot" id="status-dot"></span>
+                    <span class="status-text" id="status-text">Loading…</span>
+                </div>
+                <div class="meta" id="status-meta"></div>
+            </div>
+        </div>
+        <div class="actions" id="status-actions"></div>
+    </section>
+
+    <section class="card hidden" id="qr-card">
+        <h2>Scan to link</h2>
+        <p class="muted">
+            Open WhatsApp on your phone →
+            <strong>Settings → Linked Devices → Link a Device</strong>
+        </p>
+        <div class="qr-wrap">
+            <img id="qr-img" alt="WhatsApp QR code">
+        </div>
+        <p class="muted small">QR refreshes automatically every ~30s.</p>
+    </section>
+
+    <section class="card" id="recipients-card">
+        <h2>Recipients</h2>
+        <p class="muted small">
+            Messages are sent to each entry below.
+        </p>
+
+        <ul id="recipients-list" class="list"></ul>
+
+        <form id="recipient-form" class="row form">
+            <select name="type">
+                <option value="number">Phone</option>
+                <option value="group">Group JID</option>
+            </select>
+            <input
+                name="value"
+                placeholder="+15551234567 or 12036…@g.us"
+                required
+                autocomplete="off">
+            <input
+                name="label"
+                placeholder="Label (optional)"
+                autocomplete="off">
+            <button type="submit">Add</button>
+        </form>
+        <div id="recipient-error" class="form-error hidden"></div>
+
+    </section>
+
+    <section class="card" id="groups-card">
+        <div class="card-head">
+            <h2>Joined groups</h2>
+            <button id="refresh-groups" class="secondary tiny">Refresh</button>
+        </div>
+        <p class="muted small">
+            Toggle a group on to send messages there. The bot must
+            already be a member.
+        </p>
+
+        <div id="groups-status" class="muted small">
+            Connect WhatsApp to load groups.
+        </div>
+
+        <ul id="groups-list" class="list"></ul>
+    </section>
+
+    <section class="card" id="state-card">
+        <h2>Last synced record</h2>
+
+        <div id="state-empty" class="muted small">
+            Waiting for first sync…
+        </div>
+
+        <div id="state-detail" class="hidden record">
+            <div class="record-amount">
+                💰 <span id="rec-amount">$0.00</span>
+            </div>
+            <div class="record-line" id="rec-insurance"></div>
+            <div class="record-line muted">
+                <span id="rec-date"></span>
+            </div>
+            <div class="record-meta">
+                <span class="badge">Report #<span id="rec-key">–</span></span>
+                <span class="dotsep">·</span>
+                <span>Trace <span id="rec-trace">–</span></span>
+                <span class="dotsep">·</span>
+                <span>Synced <span id="rec-when">–</span></span>
+            </div>
+        </div>
+    </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

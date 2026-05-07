@@ -21,6 +21,9 @@ auth/
 .scraper-state.json
 .scraper-state.mock.json
 
+# Recipient list (managed via the settings UI — local-only)
+recipients.json
+
 # Transient EOB PDFs downloaded for forwarding
 .downloads/
 

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in — WhatsApp Scraper</title>
+<style>
+    :root {
+        --bg: #f5f6f8;
+        --card: #ffffff;
+        --text: #1f2330;
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --accent: #25d366;
+        --accent-dark: #128c4f;
+        --danger: #dc2626;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+            Roboto, Helvetica, Arial, sans-serif;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+    }
+    .login-card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 28px 28px 24px;
+        width: 100%;
+        max-width: 360px;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.04);
+    }
+    .login-card h1 {
+        margin: 0 0 4px;
+        font-size: 20px;
+    }
+    .subtitle {
+        margin: 0 0 22px;
+        color: var(--muted);
+        font-size: 14px;
+    }
+    .field {
+        display: block;
+        margin-bottom: 14px;
+    }
+    .field label {
+        display: block;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--muted);
+        margin-bottom: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .field input {
+        display: block;
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 14px;
+        font-family: inherit;
+    }
+    .field input:focus {
+        outline: 2px solid rgba(37, 211, 102, 0.4);
+        outline-offset: 0;
+        border-color: var(--accent);
+    }
+    button.primary {
+        background: var(--accent);
+        color: #fff;
+        border: 0;
+        width: 100%;
+        padding: 11px 14px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        margin-top: 6px;
+    }
+    button.primary:hover { background: var(--accent-dark); }
+    button.primary:disabled {
+        background: #94a3b8;
+        cursor: progress;
+    }
+    .error {
+        margin: 14px 0 0;
+        background: #fef2f2;
+        color: var(--danger);
+        border: 1px solid #fecaca;
+        padding: 8px 10px;
+        border-radius: 6px;
+        font-size: 13px;
+    }
+    .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<form id="login-form" class="login-card" autocomplete="on">
+    <h1>WhatsApp Scraper</h1>
+    <p class="subtitle">Sign in to continue.</p>
+
+    <div class="field">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text"
+               autocomplete="username" autofocus required>
+    </div>
+
+    <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password"
+               autocomplete="current-password" required>
+    </div>
+
+    <button type="submit" class="primary" id="submit-btn">Sign in</button>
+
+    <div id="error" class="error hidden"></div>
+</form>
+
+<script>
+(function () {
+    const form = document.getElementById('login-form');
+    const submitBtn = document.getElementById('submit-btn');
+    const error = document.getElementById('error');
+
+    function showError(msg) {
+        error.textContent = msg;
+        error.classList.remove('hidden');
+    }
+    function clearError() {
+        error.classList.add('hidden');
+        error.textContent = '';
+    }
+
+    form.addEventListener('input', clearError);
+
+    form.addEventListener('submit', async (e) => {
+
+        e.preventDefault();
+        clearError();
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Signing in…';
+
+        try {
+
+            const fd = new FormData(form);
+            const r = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({
+                    username: fd.get('username'),
+                    password: fd.get('password')
+                })
+            });
+
+            if (r.ok) {
+                location.href = '/';
+                return;
+            }
+
+            const data = await r.json().catch(() => ({}));
+            showError(data.error || ('Login failed (HTTP ' + r.status + ')'));
+
+        } catch (err) {
+            showError('Network error: ' + err.message);
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Sign in';
+        }
+    });
+})();
+</script>
+
+</body>
+</html>

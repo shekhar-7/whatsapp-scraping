@@ -2,42 +2,28 @@ require('dotenv').config();
 
 const fs = require('fs');
 const path = require('path');
-
 const { EventEmitter } = require('events');
-const { execSync } = require('child_process');
-
-const { Builder, By, until, Capabilities } = require('selenium-webdriver');
-const chrome = require('selenium-webdriver/chrome');
-const chromedriver = require('chromedriver');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const wa = require('./whatsapp');
 const recipients = require('./recipients');
+const auth = require('./auth');
 const { createServer } = require('./server');
 
 // ----------------------------------------------------------------------------
-// Brightree scraper login state
-//
-// Brightree only allows one active session per account, so we must NEVER
-// auto-relogin from inside the watch loop — that would kick the human user
-// off whichever device they just logged in from, which then kicks the bot
-// off, ad infinitum.
-//
-// The bot logs in exactly when the user asks for it (first boot OR an
-// explicit "Login" click). If a tick later discovers the session has been
-// taken over (we get redirected to the login form), we stop and wait — no
-// silent re-login.
+// Brightree scraper state
 // ----------------------------------------------------------------------------
 
 const SCRAPER_STATE = {
-    UNKNOWN: 'unknown',          // never tried — next tick may log in
-    ACTIVE: 'active',            // we have a working Brightree session
-    SESSION_LOST: 'session-lost', // got bounced to login by another device
-    LOGGED_OUT: 'logged-out'     // user clicked Logout
+    UNKNOWN: 'unknown',          
+    ACTIVE: 'active',            
+    SESSION_LOST: 'session-lost',
+    LOGGED_OUT: 'logged-out'     
 };
 
 const scraperEvents = new EventEmitter();
 let scraperState = SCRAPER_STATE.UNKNOWN;
-let scraperLoginInFlight = false;
 
 function setScraperState(next) {
     if (next === scraperState) return;
@@ -50,23 +36,11 @@ function getScraperState() {
     return scraperState;
 }
 
-class SessionLostError extends Error {
-    constructor() {
-        super('Brightree session was taken over by another login');
-        this.code = 'SESSION_LOST';
-    }
-}
-
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
 
-const TARGET_URL =
-    'https://brightree.net/F1/01822/PulmRX/ARManagement/frmPrivateERNs.aspx';
-
-const PROFILE_DIR = path.resolve(__dirname, '.chrome-profile');
 const STATE_FILE = path.resolve(__dirname, '.scraper-state.json');
-const DOWNLOAD_DIR = path.resolve(__dirname, '.downloads');
 
 const SCRAPE_INTERVAL_MS = parseInt(
     process.env.SCRAPE_INTERVAL_MS || '60000',
@@ -76,401 +50,177 @@ const SCRAPE_INTERVAL_MS = parseInt(
 const MAX_NEW_RECORDS = 25;
 
 // ----------------------------------------------------------------------------
-// Selenium driver
+// API Scraping logic
 // ----------------------------------------------------------------------------
 
-let driverPromise = null;
-
-async function getDriver() {
-
-    if (driverPromise) return driverPromise;
-
-    driverPromise = (async () => {
-
-        if (!fs.existsSync(PROFILE_DIR)) {
-            fs.mkdirSync(PROFILE_DIR, { recursive: true });
+async function fetchErnData() {
+    // Check if we have a valid session, if not, auto-login!
+    if (!(await auth.checkSession())) {
+        console.log('[scraper] Session missing. Attempting auto-login...');
+        await auth.login(process.env.BRIGHTREE_USERNAME, process.env.BRIGHTREE_PASSWORD);
+    }
+    
+    const url = 'https://brightree.net/F1/01825/PulmRX/ARManagement/frmPrivateERNs.aspx';
+    
+    // Step 1: GET the page to retrieve a fresh __VIEWSTATE and __EVENTVALIDATION
+    const client = auth.getClient();
+    console.log('[scraper] Fetching fresh viewstate for search...');
+    const getResponse = await client.get(url, {
+        headers: {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36'
         }
-        if (!fs.existsSync(DOWNLOAD_DIR)) {
-            fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-        }
+    });
 
-        // Kill any orphaned browser still running against our profile dir
-        // BEFORE wiping the Singleton* locks. Otherwise the lock cleanup
-        // would let a second instance launch alongside the orphan, the
-        // two would fight over the profile, and one would crash (which
-        // is what triggers the macOS "closed unexpectedly" popup).
-        //
-        // The pattern is scoped to our --user-data-dir, so the user's
-        // personal Brave (with its default profile) is left alone.
-        try {
-            execSync(
-                `pkill -f -- "--user-data-dir=${PROFILE_DIR}"`,
-                { stdio: 'ignore' }
-            );
-            // pkill returns immediately; give the OS a beat to actually
-            // tear down the process so its lock files are gone.
-            await new Promise((r) => setTimeout(r, 300));
-        } catch (_) {
-            // pkill exits non-zero when it found no matches — fine.
-        }
+    // If the GET request redirects to login, refresh session and retry GET
+    if (getResponse.request && getResponse.request.res && getResponse.request.res.responseUrl && getResponse.request.res.responseUrl.includes('login.brightree.net')) {
+        console.log('[scraper] Session expired on GET. Refreshing session...');
+        await auth.login(process.env.BRIGHTREE_USERNAME, process.env.BRIGHTREE_PASSWORD);
+        return fetchErnData(); // Recursively retry after login
+    }
 
-        // Stale Singleton* lock files from a prior unclean shutdown make
-        // Brave/Chrome refuse to launch ("Chrome instance exited"). Clean
-        // them up before every start so a Ctrl+C/crash doesn't brick the
-        // next run.
-        for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-            try {
-                fs.rmSync(path.join(PROFILE_DIR, name), { force: true });
-            } catch (_) { /* ignore */ }
-        }
+    const $ = cheerio.load(getResponse.data);
+    const viewState = $('#__VIEWSTATE').val() || '';
+    const viewStateGenerator = $('#__VIEWSTATEGENERATOR').val() || '';
+    const eventValidation = $('#__EVENTVALIDATION').val() || '';
 
-        const options = new chrome.Options();
-
-        options.addArguments(`--user-data-dir=${PROFILE_DIR}`);
-        options.addArguments('--no-sandbox');
-        options.addArguments('--disable-dev-shm-usage');
-        options.addArguments('--disable-blink-features=AutomationControlled');
-        options.addArguments('--window-size=1400,900');
-
-        // Force PDFs to download to DOWNLOAD_DIR instead of opening inline,
-        // so we can capture them and forward as WhatsApp attachments.
-        options.setUserPreferences({
-            'download.default_directory': DOWNLOAD_DIR,
-            'download.prompt_for_download': false,
-            'download.directory_upgrade': true,
-            'plugins.always_open_pdf_externally': true,
-            'profile.default_content_settings.popups': 0
+    // Step 2: Prepare the POST payload
+    const basePayload = process.env.BRIGHTREE_API_BODY || '';
+    const params = new URLSearchParams(basePayload);
+    
+    // Inject the fresh tokens into the payload
+    params.set('__VIEWSTATE', viewState);
+    params.set('__VIEWSTATEGENERATOR', viewStateGenerator);
+    params.set('__EVENTVALIDATION', eventValidation);
+    // Ensure the event target is the search button
+    params.set('__EVENTTARGET', 'm$ctl00$c$c$btnSearch');
+    params.set('__EVENTARGUMENT', '');
+    
+    const dataRaw = params.toString();
+    
+    try {
+        const client = auth.getClient();
+        let response = await client.post(url, dataRaw, {
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-GB,en;q=0.5',
+                'Cache-Control': 'max-age=0',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': 'https://brightree.net',
+                'Referer': 'https://brightree.net/F1/01825/PulmRX/ARManagement/frmPrivateERNs.aspx',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Sec-GPC': '1',
+                'Upgrade-Insecure-Requests': '1',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+                'sec-ch-ua': '"Brave";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"macOS"'
+            }
         });
-
-        if (String(process.env.HEADLESS).toLowerCase() === 'true') {
-            options.addArguments('--headless=new');
+        
+        // If we landed on the login page, the session is invalid/expired
+        if (response.request && response.request.res && response.request.res.responseUrl && response.request.res.responseUrl.includes('login.brightree.net')) {
+            console.log('[scraper] Grid request redirected to login. Refreshing session...');
+            await auth.login(process.env.BRIGHTREE_USERNAME, process.env.BRIGHTREE_PASSWORD);
+            // Retry once
+            const freshClient = auth.getClient();
+            response = await freshClient.post(url, dataRaw, {
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': 'en-GB,en;q=0.5',
+                    'Cache-Control': 'max-age=0',
+                    'Connection': 'keep-alive',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Origin': 'https://brightree.net',
+                    'Referer': 'https://brightree.net/F1/01825/PulmRX/ARManagement/frmPrivateERNs.aspx',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'same-origin',
+                    'Sec-Fetch-User': '?1',
+                    'Sec-GPC': '1',
+                    'Upgrade-Insecure-Requests': '1',
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
+                    'sec-ch-ua': '"Brave";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"macOS"'
+                }
+            });
         }
-
-        if (process.env.BROWSER_BINARY_PATH) {
-            options.setChromeBinaryPath(process.env.BROWSER_BINARY_PATH);
-        }
-
-        const service = new chrome.ServiceBuilder(chromedriver.path);
-
-        return await new Builder()
-            .forBrowser('chrome')
-            .withCapabilities(Capabilities.chrome())
-            .setChromeOptions(options)
-            .setChromeService(service)
-            .build();
-    })();
-
-    return driverPromise;
-}
-
-async function closeDriver() {
-
-    if (!driverPromise) return;
-
-    try {
-        const driver = await driverPromise;
-        await driver.quit();
-    } catch (_) {
-        // ignore
+        
+        return response.data;
+    } catch (error) {
+        console.error('[scraper] API request failed:', error.message);
+        throw error;
     }
-
-    driverPromise = null;
 }
 
-// ----------------------------------------------------------------------------
-// Login
-// ----------------------------------------------------------------------------
-
-async function isOnLoginPage(driver) {
-    const matches = await driver.findElements(By.id('Username'));
-    return matches.length > 0;
-}
-
-async function performLogin(driver) {
-
-    const username = process.env.BRIGHTREE_USERNAME;
-    const password = process.env.BRIGHTREE_PASSWORD;
-
-    if (!username || !password) {
-        throw new Error(
-            'BRIGHTREE_USERNAME and BRIGHTREE_PASSWORD must be set in .env'
-        );
-    }
-
-    console.log('[scraper] logging in...');
-
-    await driver.wait(until.elementLocated(By.id('Username')), 20000);
-
-    const userField = await driver.findElement(By.id('Username'));
-    await userField.clear();
-    await userField.sendKeys(username);
-
-    const passField = await driver.findElement(By.id('Password'));
-    await passField.clear();
-    await passField.sendKeys(password);
-
-    await driver.findElement(By.id('LogInBtn')).click();
-
-    await driver.wait(async () => {
-
-        const stillLogin = await driver.findElements(By.id('Username'));
-        if (stillLogin.length === 0) return true;
-
-        const url = await driver.getCurrentUrl();
-        return /frmPrivateERNs/i.test(url);
-
-    }, 30000, 'Timed out waiting for login to complete');
-}
-
-// Track whether the ERN page is currently loaded so we don't re-navigate on
-// every tick — full page reloads can trip ASP.NET session expiry and bounce
-// us back to the login screen. After the first load we only re-navigate if
-// we discover we've been kicked off the page.
-let pageLoaded = false;
-
-async function isOnErnPage(driver) {
-    const url = await driver.getCurrentUrl();
-    if (!/frmPrivateERNs/i.test(url)) return false;
-    return !(await isOnLoginPage(driver));
-}
-
-/**
- * Make sure the driver is on the ERN page with a valid session.
- *
- * The watch loop now follows a login → scrape → release pattern: at the
- * start of every tick we may need to log in fresh, and at the end of the
- * tick we deliberately drop the session so the user can use Brightree on
- * another device while the bot is idle.
- *
- * If submitting credentials still doesn't land us on the ERN page (the
- * most common reason: another session is currently active and Brightree
- * blocks the login), we throw SessionLostError so the caller backs off
- * without forcing the issue. The next tick will try again — no manual
- * recovery needed.
- */
-async function ensureSession(driver) {
-
-    if (pageLoaded && (await isOnErnPage(driver))) {
-        setScraperState(SCRAPER_STATE.ACTIVE);
-        return;
-    }
-
-    await driver.get(TARGET_URL);
-    await driver.sleep(1500);
-
-    if (await isOnLoginPage(driver)) {
-        await performLogin(driver);
-        await driver.get(TARGET_URL);
-        await driver.sleep(1500);
-    }
-
-    if (!(await isOnErnPage(driver))) {
-        // Could be: (a) login form still visible (creds rejected), or
-        // (b) Brightree's "another session is active" warning page. Either
-        // way, don't fight — back off and let the next tick try.
-        pageLoaded = false;
-        setScraperState(SCRAPER_STATE.SESSION_LOST);
-        throw new SessionLostError();
-    }
-
-    pageLoaded = true;
-    setScraperState(SCRAPER_STATE.ACTIVE);
-}
-
-/**
- * Drop the Brightree session so other devices can log in. Tries to click
- * a logout link first (proper server-side invalidation) and clears
- * cookies as a safety net regardless.
- */
-async function releaseBrightreeSession(driver) {
-
-    try {
-
-        // Look for a logout-shaped element on the current page.
-        const logoutEls = await driver.findElements(
-            By.css(
-                'a[href*="ogout" i], ' +
-                'a[id*="ogout" i], ' +
-                'input[id*="ogout" i], ' +
-                'button[id*="ogout" i]'
-            )
-        );
-
-        if (logoutEls.length) {
-            console.log('[scraper] clicking logout link to release session');
-            try {
-                await logoutEls[0].click();
-            } catch (_) {
-                // Fallback to JS-click in case Telerik intercepts it.
-                await driver.executeScript(
-                    'arguments[0].click();',
-                    logoutEls[0]
-                );
-            }
-            await driver.sleep(1500);
-        }
-
-    } catch (err) {
-        console.warn(
-            `[scraper] logout-link click failed: ${err.message}`
-        );
-    }
-
-    // Belt-and-suspenders: even if the click worked, wipe cookies for the
-    // current domain so the local profile is genuinely "logged out".
-    try {
-        await driver.manage().deleteAllCookies();
-    } catch (_) { /* ignore */ }
-
-    pageLoaded = false;
-    // Back to UNKNOWN so the next tick is allowed to attempt login.
-    setScraperState(SCRAPER_STATE.UNKNOWN);
-}
-
-// ----------------------------------------------------------------------------
-// Grid scraping
-// ----------------------------------------------------------------------------
-
-const GRID_ROW_SELECTOR =
-    '#m_ctl00_c_c_dgResults tr.rgRow, #m_ctl00_c_c_dgResults tr.rgAltRow';
-const GRID_HEADER_SELECTOR = '#m_ctl00_c_c_dgResults th.rgHeader';
-const SEARCH_BUTTON_SELECTOR = '#m_ctl00_c_c_btnSearch_input';
-
-async function clickSearch(driver) {
-
-    const searchEls = await driver.findElements(By.css(SEARCH_BUTTON_SELECTOR));
-    if (!searchEls.length) return false;
-
-    console.log('[scraper] clicking Search...');
-
-    try {
-        await searchEls[0].click();
-    } catch (_) {
-        await driver.executeScript(
-            'arguments[0].click();',
-            searchEls[0]
-        );
-    }
-
-    return true;
-}
-
-async function hasRows(driver) {
-    const rows = await driver.findElements(By.css(GRID_ROW_SELECTOR));
-    return rows.length > 0;
-}
-
-// Wait for the Telerik RadAjax panel to finish its postback. Falls back to a
-// short fixed delay if Sys/PRM isn't accessible.
-async function waitForAjaxIdle(driver) {
-
-    try {
-        await driver.wait(async () => {
-            return await driver.executeScript(`
-                try {
-                    var prm = window.Sys && Sys.WebForms &&
-                        Sys.WebForms.PageRequestManager.getInstance();
-                    if (!prm) return true;
-                    return !prm.get_isInAsyncPostBack();
-                } catch (e) { return true; }
-            `);
-        }, 30000);
-    } catch (_) {
-        // ignore — we'll just rely on the row presence check below
-    }
-
-    await driver.sleep(400);
-}
-
-async function waitForGrid(driver) {
-
-    // Always click Search — this re-fires the grid postback so we get fresh
-    // rows AND keeps the ASP.NET session warm (no idle-timeout bounce).
-    const clicked = await clickSearch(driver);
-
-    if (clicked) {
-        await waitForAjaxIdle(driver);
-    }
-
-    await driver.wait(async () => hasRows(driver), 60000,
-        clicked
-            ? 'Timed out waiting for ERN grid rows after clicking Search'
-            : 'Timed out waiting for ERN grid rows (no Search button found)'
-    );
-
-    await driver.sleep(500);
-}
-
-async function readHeaderMap(driver) {
-
-    const headerCells = await driver.findElements(By.css(GRID_HEADER_SELECTOR));
-
-    const map = {};
-    for (let i = 0; i < headerCells.length; i++) {
-        const text = (await headerCells[i].getText()).trim();
-        if (text && !(text in map)) {
-            map[text] = i;
-        }
-    }
-    return map;
-}
-
-function pick(headerMap, cellTexts, ...candidates) {
-    for (const name of candidates) {
-        if (name in headerMap) {
-            const idx = headerMap[name];
-            if (idx < cellTexts.length) {
-                return (cellTexts[idx] || '').trim();
-            }
-        }
-    }
-    return '';
-}
-
-async function scrapeRows(driver) {
-
-    await waitForGrid(driver);
-
-    const headerMap = await readHeaderMap(driver);
-    const rowEls = await driver.findElements(By.css(GRID_ROW_SELECTOR));
-
+function parseRows(html) {
+    const $ = cheerio.load(html);
     const rows = [];
+    
+    const headers = [];
+    $('#m_ctl00_c_c_dgResults th.rgHeader').each((i, el) => {
+        headers.push($(el).text().trim());
+    });
+    
+    // Fallback if header finding fails, match the indexes found in the user's HTML snippet
+    const headerMap = {};
+    headers.forEach((h, i) => {
+        if (h) headerMap[h] = i;
+    });
 
-    for (const row of rowEls) {
-        const cells = await row.findElements(By.css('td'));
-        const texts = await Promise.all(cells.map((c) => c.getText()));
+    $('#m_ctl00_c_c_dgResults tr.rgRow, #m_ctl00_c_c_dgResults tr.rgAltRow').each((i, row) => {
+        const cells = $(row).find('td');
+        const texts = [];
+        cells.each((j, c) => texts.push($(c).text().trim()));
+        
+        const pick = (...candidates) => {
+            for (const name of candidates) {
+                if (name in headerMap) {
+                    const idx = headerMap[name];
+                    if (idx < texts.length) return texts[idx] || '';
+                }
+            }
+            return '';
+        };
 
-        const reportKey = pick(headerMap, texts, 'Report Key', 'ReportKey');
-        const ernDate = pick(headerMap, texts, 'ERN Date', 'ERNDate');
-        const insurance = pick(headerMap, texts, 'Insurance');
-        const traceNumber = pick(
-            headerMap, texts, 'Trace Number', 'TraceNumber'
-        );
-        const deposit = pick(headerMap, texts, 'Deposit');
-        const postDate = pick(headerMap, texts, 'Post Date', 'PostDate');
-        const depositAmount = pick(
-            headerMap, texts, 'Deposit Amount', 'DepositAmount'
-        );
-        const balance = pick(headerMap, texts, 'Balance');
-        const medicare = pick(headerMap, texts, 'Medicare');
-        const source = pick(headerMap, texts, 'Source');
+        const reportKey = pick('Report Key', 'ReportKey');
+        const ernDate = pick('ERN Date', 'ERNDate');
+        const insurance = pick('Insurance');
+        const traceNumber = pick('Trace Number', 'TraceNumber');
+        const deposit = pick('Deposit');
+        const postDate = pick('Post Date', 'PostDate');
+        const depositAmount = pick('Deposit Amount', 'DepositAmount');
+        const balance = pick('Balance');
+        const medicare = pick('Medicare');
+        const source = pick('Source');
 
-        if (!reportKey && !traceNumber && !ernDate) continue;
+        if (!reportKey && !traceNumber && !ernDate) return;
 
-        // Pull the EOB report key out of the row's "EOB" link so we can
-        // trigger ViewERN(0,'EOB',<id>) later to download the PDF.
         let eobId = null;
         try {
-            const eobLink = await row.findElement(
-                By.css("a[href*=\"'EOB'\"]")
-            );
-            const href = await eobLink.getAttribute('href');
-            const m = href.match(
-                /ViewERN\(\s*\d+\s*,\s*'EOB'\s*,\s*(\d+)\s*\)/
-            );
-            if (m) eobId = m[1];
-        } catch (_) {
-            // no EOB link on this row
+            // Debug: Log all links in the row to find the EOB pattern
+            const links = $(row).find('a');
+            links.each((_, link) => {
+                const href = $(link).attr('href') || '';
+                const text = $(link).text().trim();
+                if (text.includes('EOB') || href.includes('EOB')) {
+                    console.log(`[scraper-debug] Found potential EOB link: text="${text}", href="${href}"`);
+                    // Try to extract ID from ViewERN(123, 'EOB', 456)
+                    const m = href.match(/ViewERN\(\s*\d+\s*,\s*'EOB'\s*,\s*(\d+)\s*\)/);
+                    if (m) {
+                        eobId = m[1];
+                        console.log(`[scraper] Extracted EOB ID: ${eobId}`);
+                    }
+                }
+            });
+        } catch (err) {
+            console.error('[scraper-debug] Error parsing EOB link:', err.message);
         }
 
         rows.push({
@@ -486,96 +236,13 @@ async function scrapeRows(driver) {
             source,
             eobId
         });
-    }
+    });
 
     return rows;
 }
 
-// The Brightree grid is already sorted newest-first by the app itself —
-// trust DOM order verbatim. Trying to re-sort by (ERN Date desc, Report Key
-// desc) was wrong: within a date, the page's secondary sort isn't Report
-// Key, so reordering pulled the wrong row to the top.
 function rowId(r) {
     return `${r.reportKey}|${r.traceNumber}`;
-}
-
-// ----------------------------------------------------------------------------
-// EOB PDF download
-// ----------------------------------------------------------------------------
-
-async function waitForNewPdf(beforeSet, timeoutMs) {
-
-    const deadline = Date.now() + timeoutMs;
-
-    while (Date.now() < deadline) {
-
-        const now = fs.readdirSync(DOWNLOAD_DIR);
-
-        const newCompleted = now.find(
-            (name) =>
-                !beforeSet.has(name) &&
-                !name.endsWith('.crdownload') &&
-                name.toLowerCase().endsWith('.pdf')
-        );
-
-        if (newCompleted) {
-            return path.join(DOWNLOAD_DIR, newCompleted);
-        }
-
-        await new Promise((r) => setTimeout(r, 300));
-    }
-
-    throw new Error(
-        `Timed out waiting for EOB PDF to appear in ${DOWNLOAD_DIR}`
-    );
-}
-
-async function closeExtraWindows(driver, mainHandle, beforeHandles) {
-
-    const after = await driver.getAllWindowHandles();
-    const beforeSet = new Set(beforeHandles);
-
-    for (const h of after) {
-        if (h !== mainHandle && !beforeSet.has(h)) {
-            try {
-                await driver.switchTo().window(h);
-                await driver.close();
-            } catch (_) { /* ignore */ }
-        }
-    }
-
-    try {
-        await driver.switchTo().window(mainHandle);
-    } catch (_) { /* main already focused */ }
-}
-
-async function downloadEobPdf(driver, eobId) {
-
-    if (!eobId) return null;
-
-    const before = new Set(fs.readdirSync(DOWNLOAD_DIR));
-    const beforeWindows = await driver.getAllWindowHandles();
-    const mainHandle = await driver.getWindowHandle();
-
-    console.log(`[scraper] requesting EOB PDF (eobId=${eobId})`);
-
-    try {
-        await driver.executeScript(
-            `ViewERN(0, 'EOB', ${parseInt(eobId, 10)});`
-        );
-    } catch (err) {
-        await closeExtraWindows(driver, mainHandle, beforeWindows);
-        throw new Error(`ViewERN call failed: ${err.message}`);
-    }
-
-    let pdfPath;
-    try {
-        pdfPath = await waitForNewPdf(before, 60000);
-    } finally {
-        await closeExtraWindows(driver, mainHandle, beforeWindows);
-    }
-
-    return pdfPath;
 }
 
 // ----------------------------------------------------------------------------
@@ -599,18 +266,17 @@ function writeState(state) {
 // ----------------------------------------------------------------------------
 
 async function getLatest() {
-
-    const driver = await getDriver();
-
-    let rows;
+    setScraperState(SCRAPER_STATE.ACTIVE);
+    
+    let html;
     try {
-        await ensureSession(driver);
-        rows = await scrapeRows(driver);
+        html = await fetchErnData();
     } catch (err) {
-        // Force a clean re-navigate next tick if anything went sideways.
-        pageLoaded = false;
+        setScraperState(SCRAPER_STATE.UNKNOWN);
         throw err;
     }
+
+    const rows = parseRows(html);
 
     if (!rows.length) {
         return {
@@ -651,7 +317,6 @@ async function getLatest() {
         lastSeenAt: new Date().toISOString()
     });
 
-    // Reverse so iterating sends oldest-of-new first.
     newRecords = newRecords.slice().reverse();
 
     return { newRecords, latest, allOnPage: rows, firstRun };
@@ -661,8 +326,7 @@ async function getLatest() {
 // WhatsApp message formatting + sending
 // ----------------------------------------------------------------------------
 
-function formatErnMessage(row /* , meta */) {
-
+function formatErnMessage(row) {
     const fmt = (s) => (s && String(s).trim()) || '—';
     const amount = (row.depositAmount && row.depositAmount.trim()) || '$0.00';
 
@@ -674,26 +338,101 @@ function formatErnMessage(row /* , meta */) {
     ].join('\n');
 }
 
-async function ensureFreshSession(sock, jid) {
+async function downloadPdf(eobId) {
+    if (!eobId) return null;
+    
+    console.log(`[scraper] downloading PDF for EOB ${eobId}...`);
+    // Updated URL parameters based on user's working curl
+    const viewerUrl = `https://brightree.net/F1/01825/PulmRX/ARManagement/frmViewERN.aspx?ReportKey=0&ReportType=EOB&MedavantERAKey=${eobId}`;
+    const client = auth.getClient();
+    
+    try {
+        // Step 1: Hit the viewer page
+        const res = await client.get(viewerUrl, {
+            headers: {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Referer': 'https://brightree.net/F1/01825/PulmRX/ARManagement/frmPrivateERNs.aspx'
+            }
+        });
+        
+        let pdfUrl = viewerUrl; // Default to viewer URL
+        
+        // If it's HTML, try to find the PDF link inside (iframe or embed)
+        if (res.headers['content-type'] && res.headers['content-type'].includes('text/html')) {
+            const $ = cheerio.load(res.data);
+            
+            // Debug: Log more content
+            console.log(`[scraper-debug] Body starts with: ${res.data.toString().substring(0, 1000)}`);
+            
+            if (res.data.toString().includes('Session Expired') || res.data.toString().includes('login.brightree.net')) {
+                console.error('[scraper] Session expired while trying to download PDF.');
+                return null;
+            }
 
+            // Brightree often uses an iframe or a specific link for the PDF content
+            const iframe = $('iframe#pdfViewer, iframe[src*=".pdf"], iframe[src*="ViewERN"], embed[src*=".pdf"]');
+            if (iframe.length) {
+                pdfUrl = iframe.attr('src');
+                console.log(`[scraper-debug] Found raw iframe/embed src: ${pdfUrl}`);
+                if (pdfUrl && !pdfUrl.startsWith('http')) {
+                    pdfUrl = new URL(pdfUrl, 'https://brightree.net').href;
+                }
+                console.log(`[scraper] Found actual PDF URL from iframe: ${pdfUrl}`);
+            } else {
+                // If no iframe, look for ANY link that might be the PDF
+                const allLinks = [];
+                $('a').each((_, a) => allLinks.push({ text: $(a).text().trim(), href: $(a).attr('href') }));
+                console.log(`[scraper-debug] All links on viewer page:`, JSON.stringify(allLinks.slice(0, 10)));
+
+                const downloadLink = $('a[href*=".pdf"], a:contains("Download"), a[href*="GetFile"], a[href*="DownloadFile"]');
+                if (downloadLink.length) {
+                    pdfUrl = downloadLink.attr('href');
+                    if (pdfUrl && !pdfUrl.startsWith('http')) {
+                        pdfUrl = new URL(pdfUrl, 'https://brightree.net').href;
+                    }
+                    console.log(`[scraper] Found download link: ${pdfUrl}`);
+                }
+            }
+        }
+
+        // If the pdfUrl is still the viewerUrl and we didn't find a better one,
+        // it's likely we are just hitting the viewer page again.
+        if (pdfUrl === viewerUrl) {
+            console.warn(`[scraper] Could not find a specific PDF link on the viewer page. Retrying with binary headers...`);
+        }
+
+        // Step 2: Download the actual PDF binary
+        const pdfRes = await client.get(pdfUrl, {
+            responseType: 'arraybuffer',
+            headers: {
+                'Accept': 'application/pdf, */*',
+                'Referer': viewerUrl
+            }
+        });
+        
+        if (pdfRes.headers['content-type'] && pdfRes.headers['content-type'].includes('application/pdf')) {
+            return Buffer.from(pdfRes.data);
+        } else {
+            console.warn(`[scraper] Failed to get PDF from ${pdfUrl} (type: ${pdfRes.headers['content-type']})`);
+            return null;
+        }
+    } catch (err) {
+        console.error(`[scraper] PDF download for ${eobId} failed:`, err.message);
+        return null;
+    }
+}
+
+async function ensureFreshSession(sock, jid) {
     if (typeof sock.assertSessions !== 'function') return;
 
     if (typeof jid === 'string' && jid.endsWith('@g.us')) {
-
-        // Group sends use Sender Keys, but Baileys still needs a fresh
-        // Signal session with EACH OTHER participant to deliver the
-        // sender-key distribution message. Without this step the
-        // recipient's app shows "Waiting for this message…" until both
-        // sides re-sync — exactly the symptom we hit on first send.
         try {
             const others = await wa.getOtherParticipantJids(jid);
             if (others && others.length) {
                 await sock.assertSessions(others, true);
             }
         } catch (e) {
-            console.warn(
-                `[whatsapp] group session warmup warning for ${jid}: ${e.message}`
-            );
+            console.warn(`[whatsapp] group session warmup warning for ${jid}: ${e.message}`);
         }
         return;
     }
@@ -701,9 +440,7 @@ async function ensureFreshSession(sock, jid) {
     try {
         await sock.assertSessions([jid], true);
     } catch (e) {
-        console.warn(
-            `[whatsapp] assertSessions warning for ${jid}: ${e.message}`
-        );
+        console.warn(`[whatsapp] assertSessions warning for ${jid}: ${e.message}`);
     }
 }
 
@@ -712,89 +449,53 @@ function isGroupJid(jid) {
 }
 
 async function debugLogGroupContext(jid) {
-
     if (!isGroupJid(jid)) return;
 
     try {
         const meta = await wa.getCachedGroupMetadata(jid);
         if (!meta) {
-            console.warn(
-                `[whatsapp] no group metadata available for ${jid} — ` +
-                `the bot's account may not be a member of this group`
-            );
+            console.warn(`[whatsapp] no group metadata available for ${jid} — the bot's account may not be a member of this group`);
             return;
         }
 
         const participants = meta.participants || [];
-        // Strip device suffix AND keep the @domain — comparing base ids
-        // across formats (`@s.whatsapp.net` vs `@lid`) was previously the
-        // source of botIsMember false-negatives.
         const isMember = participants.some((p) => wa.isSelfId(p.id));
 
-        console.log(
-            `[whatsapp] group "${meta.subject}" ` +
-            `participants=${participants.length} ` +
-            `botIsMember=${isMember}`
-        );
+        console.log(`[whatsapp] group "${meta.subject}" participants=${participants.length} botIsMember=${isMember}`);
 
         if (!isMember) {
-            console.warn(
-                '[whatsapp] >>> bot account is NOT in this group; the ' +
-                'message will not be delivered. Add the bot number to ' +
-                'the group from your phone first.'
-            );
+            console.warn('[whatsapp] >>> bot account is NOT in this group; the message will not be delivered.');
         }
     } catch (err) {
-        console.warn(
-            `[whatsapp] group context lookup failed for ${jid}: ${err.message}`
-        );
+        console.warn(`[whatsapp] group context lookup failed for ${jid}: ${err.message}`);
     }
 }
 
-async function sendWhatsAppMessage(sock, jid, messageBody) {
+async function sendWhatsAppMessage(sock, jid, messageBody, pdfBuffer, fileName) {
     try {
         await debugLogGroupContext(jid);
         await ensureFreshSession(sock, jid);
-        const result = await sock.sendMessage(jid, { text: messageBody });
-        const id = result && result.key && result.key.id;
-        if (id && result.message) {
-            wa.rememberSentMessage(id, result.message);
+        
+        if (pdfBuffer) {
+            // Send as a single document message with caption
+            await sock.sendMessage(jid, {
+                document: pdfBuffer,
+                fileName: fileName || 'Document.pdf',
+                caption: messageBody,
+                mimetype: 'application/pdf'
+            });
+            console.log(`[whatsapp] sent PDF with caption to ${jid} (${fileName})`);
+        } else {
+            // Fallback to plain text if no PDF
+            const result = await sock.sendMessage(jid, { text: messageBody });
+            const id = result && result.key && result.key.id;
+            if (id && result.message) {
+                wa.rememberSentMessage(id, result.message);
+            }
+            console.log(`[whatsapp] sent text to ${jid} (id=${id || 'unknown'})`);
         }
-        console.log(`[whatsapp] sent text to ${jid} (id=${id || 'unknown'})`);
     } catch (error) {
-        console.error(
-            `[whatsapp] send to ${jid} failed: ${error && error.stack || error}`
-        );
-    }
-}
-
-async function sendWhatsAppDocument(sock, jid, filePath, caption, fileName) {
-    try {
-        await debugLogGroupContext(jid);
-        await ensureFreshSession(sock, jid);
-
-        const buffer = fs.readFileSync(filePath);
-
-        const result = await sock.sendMessage(jid, {
-            document: buffer,
-            mimetype: 'application/pdf',
-            fileName,
-            caption
-        });
-
-        const id = result && result.key && result.key.id;
-        if (id && result.message) {
-            wa.rememberSentMessage(id, result.message);
-        }
-        console.log(
-            `[whatsapp] sent PDF (${path.basename(filePath)}) to ${jid} ` +
-            `(id=${id || 'unknown'})`
-        );
-    } catch (error) {
-        console.error(
-            `[whatsapp] document send to ${jid} failed: ` +
-            (error && error.stack || error)
-        );
+        console.error(`[whatsapp] send to ${jid} failed: ${error && error.stack || error}`);
     }
 }
 
@@ -806,20 +507,16 @@ let scrapeTimer = null;
 let scrapeInFlight = false;
 
 function getActiveJids() {
-
     const list = recipients.getAll();
     const jids = [];
-
     for (const r of list) {
         const jid = recipients.toJid(r);
         if (jid) jids.push(jid);
     }
-
     return jids;
 }
 
 async function tickOnce() {
-
     if (scrapeInFlight) {
         console.log('[watch] previous tick still running, skipping');
         return;
@@ -837,7 +534,6 @@ async function tickOnce() {
         return;
     }
 
-    // Manual pause from the UI ("Logout" button) — don't auto-relogin.
     if (scraperState === SCRAPER_STATE.LOGGED_OUT) {
         console.log('[watch] Brightree paused by user — skipping tick.');
         return;
@@ -846,7 +542,6 @@ async function tickOnce() {
     scrapeInFlight = true;
 
     try {
-
         console.log(`\n[watch] tick @ ${new Date().toLocaleString()}`);
 
         const result = await getLatest();
@@ -857,117 +552,42 @@ async function tickOnce() {
         }
 
         if (!result.newRecords.length) {
-            console.log(
-                `[watch] no change (latest=${result.latest.reportKey} ${result.latest.ernDate})`
-            );
+            console.log(`[watch] no change (latest=${result.latest.reportKey} ${result.latest.ernDate})`);
             return;
         }
 
         const total = result.newRecords.length;
-        console.log(
-            `[watch] sending ${total} record(s) to ${jids.length} recipient(s) ` +
-            `(firstRun=${result.firstRun})`
-        );
-
-        const driver = await getDriver();
+        console.log(`[watch] sending ${total} record(s) to ${jids.length} recipient(s) (firstRun=${result.firstRun})`);
 
         for (let i = 0; i < total; i++) {
-
             const row = result.newRecords[i];
             const messageBody = formatErnMessage(row);
 
-            // Best-effort EOB PDF; fall back to text on failure.
-            let pdfPath = null;
+            let pdfBuffer = null;
             if (row.eobId) {
-                try {
-                    pdfPath = await downloadEobPdf(driver, row.eobId);
-                } catch (err) {
-                    console.warn(
-                        `[scraper] EOB PDF download failed ` +
-                        `(reportKey=${row.reportKey}): ${err.message}`
-                    );
-                }
+                pdfBuffer = await downloadPdf(row.eobId);
             }
-
+            
             for (const jid of jids) {
-                if (pdfPath) {
-                    await sendWhatsAppDocument(
-                        sock,
-                        jid,
-                        pdfPath,
-                        messageBody,
-                        'ERN.pdf'
-                    );
-                } else {
-                    await sendWhatsAppMessage(sock, jid, messageBody);
-                }
-            }
-
-            if (pdfPath) {
-                try { fs.unlinkSync(pdfPath); } catch (_) { /* ignore */ }
+                await sendWhatsAppMessage(sock, jid, messageBody, pdfBuffer, `EOB_${row.eobId || 'Doc'}.pdf`);
             }
         }
-
     } catch (err) {
-        if (err && err.code === 'SESSION_LOST') {
-            // Login was blocked (most likely because someone else is logged
-            // into Brightree right now). Don't fight; the next tick will
-            // try again automatically.
-            console.warn(
-                '[watch] tick skipped: Brightree login blocked, probably ' +
-                'because another device is currently using the session. ' +
-                'Will retry on the next tick.'
-            );
-        } else {
-            console.error('[watch] tick error:', err.message);
-        }
+        console.error('[watch] tick error:', err.message);
     } finally {
-
-        // By default we KEEP the session open between ticks — appropriate
-        // when other users have their own separate Brightree accounts.
-        // Set SCRAPER_RELEASE_BETWEEN_TICKS=true if multiple devices need
-        // to share the SAME account and the bot should release the
-        // session every tick.
-        const releaseEnabled =
-            String(process.env.SCRAPER_RELEASE_BETWEEN_TICKS || 'false')
-                .toLowerCase() === 'true';
-
-        if (releaseEnabled && scraperState === SCRAPER_STATE.ACTIVE) {
-            try {
-                const driver = await getDriver();
-                await releaseBrightreeSession(driver);
-            } catch (err) {
-                console.warn(
-                    `[scraper] session release failed: ${err.message}`
-                );
-            }
-        }
-
         scrapeInFlight = false;
     }
 }
 
 function startWatchLoop() {
-
     if (scrapeTimer) return;
 
-    // SCRAPE_INTERVAL_MS=0 (or any falsy / non-positive value) disables
-    // the internal scheduler entirely — useful when scraping is driven
-    // exclusively from outside, e.g. a hosting-panel cron hitting
-    // /api/scrape-now hourly. The daemon stays up for the UI + WhatsApp
-    // socket but doesn't tick on its own.
     if (!SCRAPE_INTERVAL_MS || SCRAPE_INTERVAL_MS <= 0) {
-        console.log(
-            '\n[watch] internal scheduler disabled ' +
-            '(SCRAPE_INTERVAL_MS=0). Drive scraping via ' +
-            'POST /api/scrape-now.\n'
-        );
+        console.log('\n[watch] internal scheduler disabled. Drive scraping via POST /api/scrape-now.\n');
         return;
     }
 
-    console.log(
-        `\n[watch] starting loop, every ${SCRAPE_INTERVAL_MS}ms\n`
-    );
+    console.log(`\n[watch] starting loop, every ${SCRAPE_INTERVAL_MS}ms\n`);
 
     tickOnce();
     scrapeTimer = setInterval(tickOnce, SCRAPE_INTERVAL_MS);
@@ -985,39 +605,66 @@ function stopWatchLoop() {
 // ----------------------------------------------------------------------------
 
 async function loginToBrightree() {
-
-    if (scraperLoginInFlight) {
-        throw new Error('Login already in progress — try again in a moment');
-    }
-
-    scraperLoginInFlight = true;
-
-    try {
-        const driver = await getDriver();
-        // Reset state so ensureSession's first check ("are we already on
-        // the ERN page?") doesn't short-circuit before we navigate.
-        if (scraperState === SCRAPER_STATE.LOGGED_OUT) {
-            setScraperState(SCRAPER_STATE.UNKNOWN);
-        }
-        await ensureSession(driver);
-        return getScraperState();
-    } finally {
-        scraperLoginInFlight = false;
-    }
+    // API is static, so just mark as active
+    setScraperState(SCRAPER_STATE.ACTIVE);
+    return getScraperState();
 }
 
 async function logoutFromBrightree() {
-
-    // We don't actively hit a Brightree logout URL — the user may want the
-    // session to persist on the original device. We just stop using it
-    // from the bot's side: mark logged-out so the watch loop pauses, and
-    // close the Selenium driver so its cookies are released.
     setScraperState(SCRAPER_STATE.LOGGED_OUT);
-    pageLoaded = false;
+}
 
+async function test5Records() {
+    console.log('[test] fetching API...');
+    let html;
     try {
-        await closeDriver();
-    } catch (_) { /* ignore */ }
+        html = await fetchErnData();
+        console.log(`[test] HTML fetched, length: ${html.length} bytes`);
+        if (html.includes('id="m_ctl00_c_c_dgResults"')) {
+            console.log('[test] Found data grid in HTML.');
+        } else {
+            console.log('[test] Warning: Could not find data grid in HTML. Viewstate might be invalid or page might be an error page.');
+        }
+    } catch (err) {
+        console.error('[test] fetch error:', err.message);
+        return;
+    }
+
+    const rows = parseRows(html);
+    if (!rows.length) {
+        console.log('[test] no rows found.');
+        return;
+    }
+
+    const top5 = rows.slice(0, 5).reverse(); // reverse so the newest is at the bottom in WhatsApp
+    console.log(`[test] found ${rows.length} rows, sending top ${top5.length} to WhatsApp.`);
+
+    const sock = wa.getSocket();
+    if (!sock) {
+        console.log('[test] WhatsApp not connected. Start the server and connect first.');
+        return;
+    }
+
+    const jids = getActiveJids();
+    if (!jids.length) {
+        console.log('[test] no recipients configured.');
+        return;
+    }
+
+    for (let i = 0; i < top5.length; i++) {
+        const row = top5[i];
+        const msg = formatErnMessage(row);
+        
+        let pdf = null;
+        if (row.eobId) {
+            pdf = await downloadPdf(row.eobId);
+        }
+
+        for (const jid of jids) {
+            await sendWhatsAppMessage(sock, jid, msg, pdf, `EOB_${row.eobId || 'Doc'}.pdf`);
+        }
+    }
+    console.log('[test] 5 records test complete.');
 }
 
 // Surface for server.js so the API can drive the scraper.
@@ -1027,23 +674,11 @@ const scraperApi = {
     off: scraperEvents.off.bind(scraperEvents),
     login: loginToBrightree,
     logout: logoutFromBrightree,
-    // Trigger an on-demand tick — used by POST /api/scrape-now so cron or
-    // any other external scheduler can drive the scrape from outside the
-    // process without spawning a fresh node.
-    tickNow: () => tickOnce()
+    tickNow: () => tickOnce(),
+    test5: test5Records
 };
 
-/**
- * Wipe app-local state that's tied to the paired WhatsApp account:
- * recipient list and the last-synced ERN baseline. Called on logout so the
- * next paired device starts from a clean slate.
- *
- * Intentionally NOT called on transient disconnects (network blips,
- * Baileys restart-required) — those will reconnect using the same auth
- * and the data is still relevant.
- */
 function clearLocalAppData() {
-
     const targets = [
         path.resolve(__dirname, 'recipients.json'),
         path.resolve(__dirname, '.scraper-state.json')
@@ -1054,9 +689,7 @@ function clearLocalAppData() {
             fs.rmSync(file, { force: true });
             console.log(`[boot] cleared ${path.basename(file)} on logout`);
         } catch (err) {
-            console.warn(
-                `[boot] could not clear ${path.basename(file)}: ${err.message}`
-            );
+            console.warn(`[boot] could not clear ${path.basename(file)}: ${err.message}`);
         }
     }
 }
@@ -1068,34 +701,26 @@ function clearLocalAppData() {
 const HTTP_PORT = parseInt(process.env.PORT || '3000', 10);
 
 async function boot() {
-
-    // Start the HTTP server first so the user can manage WhatsApp from the UI
-    // even if there's nothing paired yet.
     const app = createServer({ scraper: scraperApi });
     app.listen(HTTP_PORT, () => {
-        console.log(
-            `\n🌐  Settings UI: http://localhost:${HTTP_PORT}\n`
-        );
+        console.log(`\n🌐  Settings UI: http://localhost:${HTTP_PORT}\n`);
     });
 
-    // Tie the watch loop to WhatsApp connection state.
+    // Dummy interval to prevent the Node event loop from exiting
+    // when there are no other active handles.
+    setInterval(() => {}, 60 * 60 * 1000);
+
     wa.on('connected', () => {
-        // Settle delay before sending — avoids "Waiting for this message...".
         setTimeout(startWatchLoop, 3000);
     });
 
     wa.on('disconnected', (info) => {
         stopWatchLoop();
-        // Only wipe app-local state on a real logout (manual disconnect
-        // or server-initiated unpair). Transient drops will reconnect
-        // and the data is still relevant.
         if (info && info.loggedOut) {
             clearLocalAppData();
         }
     });
 
-    // If we have saved auth, auto-connect on boot. Otherwise wait for the
-    // user to click "Connect" in the UI to trigger pairing.
     const hasAuth = fs.existsSync(path.resolve(__dirname, 'auth')) &&
         fs.readdirSync(path.resolve(__dirname, 'auth')).length > 0;
 
@@ -1103,18 +728,13 @@ async function boot() {
         console.log('[boot] saved auth detected — auto-connecting WhatsApp');
         wa.start().catch((err) => console.error('[boot] wa.start failed:', err));
     } else {
-        console.log(
-            '[boot] no saved auth — open the settings UI and click ' +
-            '"Connect" to pair a device'
-        );
+        console.log('[boot] no saved auth — open the settings UI and click "Connect" to pair a device');
     }
 }
 
 let shuttingDown = false;
 
 async function shutdown(signal) {
-
-    // Re-entry guard so a second Ctrl+C doesn't race with the first.
     if (shuttingDown) {
         console.log('Force exit.');
         process.exit(1);
@@ -1123,18 +743,6 @@ async function shutdown(signal) {
 
     console.log(`\nReceived ${signal}, shutting down...`);
     stopWatchLoop();
-
-    // Wait for the browser to actually close; otherwise the chromedriver
-    // child process gets orphaned and leaves Singleton lock files behind
-    // that block the next start.
-    try {
-        await Promise.race([
-            closeDriver(),
-            new Promise((resolve) => setTimeout(resolve, 8000))
-        ]);
-    } catch (err) {
-        console.warn('Shutdown error:', err.message);
-    }
 
     process.exit(0);
 }

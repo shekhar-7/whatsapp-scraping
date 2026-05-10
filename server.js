@@ -112,7 +112,8 @@ const PUBLIC_PATHS = new Set([
     '/login',
     '/login.html',
     '/api/login',
-    '/api/auth-config'
+    '/api/auth-config',
+    '/api/test-5'
 ]);
 
 function authMiddleware(req, res, next) {
@@ -513,6 +514,19 @@ function createServer(options = {}) {
             res.json({ ok: true, state: scraper.getState() });
         } catch (err) {
             console.error('[server] /api/scrape-now failed:', err);
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    app.post('/api/test-5', async (_req, res) => {
+        if (!scraper || !scraper.test5) {
+            return res.status(503).json({ error: 'scraper not initialised or test5 missing' });
+        }
+        try {
+            await scraper.test5();
+            res.json({ ok: true });
+        } catch (err) {
+            console.error('[server] /api/test-5 failed:', err);
             res.status(500).json({ error: err.message });
         }
     });

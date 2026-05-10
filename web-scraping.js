@@ -951,6 +951,20 @@ function startWatchLoop() {
 
     if (scrapeTimer) return;
 
+    // SCRAPE_INTERVAL_MS=0 (or any falsy / non-positive value) disables
+    // the internal scheduler entirely — useful when scraping is driven
+    // exclusively from outside, e.g. a hosting-panel cron hitting
+    // /api/scrape-now hourly. The daemon stays up for the UI + WhatsApp
+    // socket but doesn't tick on its own.
+    if (!SCRAPE_INTERVAL_MS || SCRAPE_INTERVAL_MS <= 0) {
+        console.log(
+            '\n[watch] internal scheduler disabled ' +
+            '(SCRAPE_INTERVAL_MS=0). Drive scraping via ' +
+            'POST /api/scrape-now.\n'
+        );
+        return;
+    }
+
     console.log(
         `\n[watch] starting loop, every ${SCRAPE_INTERVAL_MS}ms\n`
     );

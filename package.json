@@ -1,10 +1,10 @@
 {
   "name": "whatsapp-scraping",
   "version": "1.0.0",
-  "description": "POC for scraping data and sending via Twilio WhatsApp",
-  "main": "app.js",
+  "description": "POC for scraping data and sending via baileys WhatsApp",
+  "main": "server.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
